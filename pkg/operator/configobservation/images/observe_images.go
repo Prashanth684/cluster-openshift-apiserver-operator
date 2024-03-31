@@ -2,12 +2,14 @@ package images
 
 import (
 	"bytes"
+	"strings"
 	"encoding/json"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/klog/v2"
 
+	imagev1 "github.com/openshift/api/image/v1"
 	"github.com/openshift/library-go/pkg/operator/configobserver"
 	"github.com/openshift/library-go/pkg/operator/events"
 
@@ -143,6 +145,60 @@ func ObserveAllowedRegistriesForImport(genericListers configobserver.Listers, re
 		if err != nil {
 			return prevObservedConfig, append(errs, err)
 		}
+	}
+
+	return observedConfig, errs
+}
+
+func ObserveImagestreamImportMode(genericListers configobserver.Listers, recorder events.Recorder, existingConfig map[string]interface{}) (map[string]interface{}, []error) {
+	listers := genericListers.(configobservation.Listers)
+	var errs []error
+	prevObservedConfig := map[string]interface{}{}
+
+	clusterVersion, err := listers.ClusterVersionLister.Get("version")
+	if err != nil {
+		return prevObservedConfig, append(errs, err)
+	}
+	importmodeToSet := imagev1.ImportModeLegacy
+	for _, condition := range clusterVersion.Status.Conditions {
+		if strings.Contains(condition.Message, "architecture=\"Multi\""){
+			importmodeToSet = imagev1.ImportModePreserveOriginal
+			break
+		}
+	}
+
+	// first observe all the existing config values so that if we get any errors
+	// we can at least return those.
+	imagestreamImportModePath := []string{"imagePolicyConfig", "imagestreamImportMode"}
+	currentImagestreamImportMode, _, err := unstructured.NestedString(existingConfig, imagestreamImportModePath...)
+	if err != nil {
+		return prevObservedConfig, append(errs, err)
+	}
+	if len(currentImagestreamImportMode) > 0 {
+		err := unstructured.SetNestedField(prevObservedConfig, currentImagestreamImportMode, imagestreamImportModePath...)
+		if err != nil {
+			return prevObservedConfig, append(errs, err)
+		}
+	}
+
+	// now gather the cluster config and turn it into the observed config
+	observedConfig := map[string]interface{}{}
+	configImage, err := listers.ImageConfigLister.Get("cluster")
+	if errors.IsNotFound(err) {
+		klog.Warningf("image.config.openshift.io/cluster: not found")
+		return observedConfig, errs
+	}
+	if err != nil {
+		return prevObservedConfig, append(errs, err)
+	}
+
+	imagestreamImportMode := string(configImage.Spec.ImagestreamImportMode)
+	if len(imagestreamImportMode) <= 0 {
+		imagestreamImportMode = string(importmodeToSet)
+	}
+	err = unstructured.SetNestedField(observedConfig, imagestreamImportMode, imagestreamImportModePath...)
+	if err != nil {
+		return prevObservedConfig, append(errs, err)
 	}
 
 	return observedConfig, errs
